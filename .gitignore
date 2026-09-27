@@ -1,0 +1,5 @@
+# Database locale con i dati del portafoglio e relativi backup
+*.db
+
+__pycache__/
+.venv/
