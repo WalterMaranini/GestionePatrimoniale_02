@@ -3,6 +3,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime
 import pandas as pd
+import altair as alt
 import re
 import calendar
 
@@ -1214,6 +1215,78 @@ def calendario_cedole(scadenza, frequenza, oggi):
     return sorted(future), data_cedola
 
 
+def dati_obbligazione_completi(titolo):
+    """Obbligazione con scadenza e cedola (e frequenza, se non zero coupon)."""
+    return bool(
+        titolo["prezzo_percentuale"]
+        and titolo["data_scadenza"] is not None
+        and titolo["cedola_pct"] is not None
+        and (titolo["cedola_pct"] <= 0 or titolo["frequenza_cedola"])
+    )
+
+
+def piano_cedole(titolo, oggi):
+    """
+    Date delle cedole future, data dell'ultima cedola staccata e
+    importo di ciascuna cedola in % del nominale (zero coupon:
+    nessuna cedola). Richiede dati_obbligazione_completi.
+    """
+    if titolo["cedola_pct"] > 0:
+        frequenza = titolo["frequenza_cedola"]
+        date_cedole, ultima_cedola = calendario_cedole(
+            titolo["data_scadenza"], frequenza, oggi
+        )
+        return date_cedole, ultima_cedola, titolo["cedola_pct"] / frequenza
+
+    return [], None, 0.0
+
+
+def flussi_futuri_obbligazione(titolo, analisi, cambio, oggi=None):
+    """
+    Cedole future e rimborso a scadenza della quantità in portafoglio,
+    in EUR al cambio indicato (ipotesi: cambio invariato fino a
+    scadenza). Ogni flusso è un dict con data, tipo, importo lordo e
+    netto (cedole tassate all'aliquota del titolo, imposta stimata
+    sulla plusvalenza al rimborso, senza compensazioni).
+    Lista vuota se la posizione è chiusa, il titolo è scaduto, mancano
+    i dati in anagrafica o il cambio.
+    """
+    oggi = oggi or date.today()
+
+    if (
+        not analisi["aperta"]
+        or not cambio
+        or not dati_obbligazione_completi(titolo)
+        or titolo["data_scadenza"] <= oggi
+    ):
+        return []
+
+    aliquota = float(titolo["tassazione_pct"]) / 100
+    date_cedole, _, cedola_periodo = piano_cedole(titolo, oggi)
+
+    nominale = analisi["quantita_aperta"]
+    cedola_eur = cedola_periodo * nominale / 100 / cambio
+    rimborso_eur = nominale / cambio
+    imposta_rimborso = (
+        max(rimborso_eur - analisi["carico_residuo"], 0) * aliquota
+    )
+
+    return [
+        {
+            "data": d,
+            "tipo": "Cedola",
+            "lordo": cedola_eur,
+            "netto": cedola_eur * (1 - aliquota)
+        }
+        for d in date_cedole
+    ] + [{
+        "data": titolo["data_scadenza"],
+        "tipo": "Rimborso",
+        "lordo": rimborso_eur,
+        "netto": rimborso_eur - imposta_rimborso
+    }]
+
+
 def analizza_obbligazione(
     titolo,
     analisi,
@@ -1238,15 +1311,8 @@ def analizza_obbligazione(
     """
     oggi = oggi or date.today()
     scadenza = titolo["data_scadenza"]
-    cedola_pct = titolo["cedola_pct"]
-    frequenza = titolo["frequenza_cedola"]
 
-    if (
-        not titolo["prezzo_percentuale"]
-        or scadenza is None
-        or cedola_pct is None
-        or (cedola_pct > 0 and not frequenza)
-    ):
+    if not dati_obbligazione_completi(titolo):
         return None
 
     aliquota = float(titolo["tassazione_pct"]) / 100
@@ -1260,15 +1326,15 @@ def analizza_obbligazione(
     if risultato["scaduta"]:
         return risultato
 
-    if cedola_pct > 0:
-        date_cedole, ultima_cedola = calendario_cedole(scadenza, frequenza, oggi)
-        cedola_periodo = cedola_pct / frequenza
+    date_cedole, ultima_cedola, cedola_periodo = piano_cedole(titolo, oggi)
+
+    if date_cedole:
         rateo = cedola_periodo * (
             (oggi - ultima_cedola).days
             / (date_cedole[0] - ultima_cedola).days
         )
     else:
-        date_cedole, cedola_periodo, rateo = [], 0.0, 0.0
+        rateo = 0.0
 
     risultato["rateo"] = rateo
 
@@ -1297,23 +1363,12 @@ def analizza_obbligazione(
         risultato["ytm_netto"] = xirr(flussi_mercato(aliquota))
 
     # 2) Rendimento a scadenza dell'investimento, in EUR
-    if analisi["aperta"] and cambio_attuale:
+    futuri = flussi_futuri_obbligazione(titolo, analisi, cambio_attuale, oggi)
 
-        nominale = analisi["quantita_aperta"]
-        cedola_eur = cedola_periodo * nominale / 100 / cambio_attuale
-        rimborso_eur = nominale / cambio_attuale
-        imposta_rimborso = (
-            max(rimborso_eur - analisi["carico_residuo"], 0) * aliquota
-        )
+    if futuri:
 
-        futuri_lordi = (
-            [(d, cedola_eur) for d in date_cedole]
-            + [(scadenza, rimborso_eur)]
-        )
-        futuri_netti = (
-            [(d, cedola_eur * (1 - aliquota)) for d in date_cedole]
-            + [(scadenza, rimborso_eur - imposta_rimborso)]
-        )
+        futuri_lordi = [(f["data"], f["lordo"]) for f in futuri]
+        futuri_netti = [(f["data"], f["netto"]) for f in futuri]
 
         flussi_netti = analisi["flussi_netti_storici"] + futuri_netti
 
@@ -1425,6 +1480,138 @@ def valutazione_online(titolo):
         "data_prezzo": quotazione["data"],
         "fonte": "Online"
     }
+
+
+# ============================================================
+# FLUSSI DI CASSA
+# ============================================================
+
+# Colori delle barre e dello sfondo per il tema chiaro e scuro
+COLORI_FLUSSI = {
+    "light": {"Entrata": "#2a78d6", "Uscita": "#e34948", "sfondo": "#ffffff"},
+    "dark": {"Entrata": "#3987e5", "Uscita": "#e66767", "sfondo": "#0e1117"}
+}
+
+
+def flussi_cassa_titolo(titolo, movimenti, analisi, cambio, oggi):
+    """
+    Flussi di cassa in EUR di un titolo: quelli avvenuti (dai
+    movimenti registrati) e, per le obbligazioni in portafoglio,
+    cedole e rimborso previsti fino a scadenza. Importi con segno:
+    positivi le entrate, negativi le uscite.
+    """
+    righe = []
+
+    for m in movimenti.itertuples():
+        segno = segno_flusso(m.operazione)
+        righe.append({
+            "Data": datetime.strptime(m.data, "%Y-%m-%d").date(),
+            "Tipo": m.operazione,
+            "Stato": "Avvenuto",
+            "Lordo": segno * (m.totale_valore_eur - m.ritenuta_eur),
+            "Netto": segno * m.totale_valore_eur
+        })
+
+    for f in flussi_futuri_obbligazione(titolo, analisi, cambio, oggi):
+        righe.append({
+            "Data": f["data"],
+            "Tipo": f["tipo"],
+            "Stato": "Previsto",
+            "Lordo": f["lordo"],
+            "Netto": f["netto"]
+        })
+
+    return pd.DataFrame(
+        righe, columns=["Data", "Tipo", "Stato", "Lordo", "Netto"]
+    )
+
+
+def grafico_flussi(df, oggi, tema="light"):
+    """
+    Barre mensili dei flussi (entrate sopra lo zero, uscite sotto),
+    con i flussi previsti più chiari e una linea sulla data di oggi.
+    Più flussi nello stesso mese sono impilati, separati da un bordo
+    del colore dello sfondo.
+    """
+    colori = COLORI_FLUSSI.get(tema, COLORI_FLUSSI["light"])
+    direzioni = ["Entrata", "Uscita"]
+
+    df = df.assign(
+        Data=pd.to_datetime(df["Data"]),
+        # Metà del mese: i flussi dello stesso mese finiscono
+        # sulla stessa barra
+        Mese=pd.to_datetime(df["Data"]).dt.to_period("M").dt.to_timestamp()
+        + pd.Timedelta(days=14),
+        Direzione=["Entrata" if v >= 0 else "Uscita" for v in df["Importo"]]
+    )
+
+    # Un mese di margine ai lati; il periodo include sempre oggi
+    inizio = aggiungi_mesi(min(df["Data"].min().date(), oggi), -1)
+    fine = aggiungi_mesi(max(df["Data"].max().date(), oggi), 1)
+    asse_x = alt.Scale(domain=[inizio.isoformat(), fine.isoformat()])
+
+    # Larghezza delle barre in pixel in base ai mesi rappresentati
+    # (grafico largo circa 700 px), così restano visibili anche su
+    # periodi lunghi. Il bordo che separa i flussi impilati si
+    # toglie quando le barre sono troppo sottili.
+    mesi = (fine.year - inizio.year) * 12 + fine.month - inizio.month
+    larghezza = min(max(700 / mesi * 0.7, 4), 40)
+
+    barre = alt.Chart(df).mark_bar(
+        size=larghezza,
+        cornerRadiusEnd=3 if larghezza >= 8 else 0,
+        stroke=colori["sfondo"],
+        strokeWidth=1.5 if larghezza >= 8 else 0
+    ).encode(
+        x=alt.X(
+            "Mese:T",
+            title=None,
+            scale=asse_x,
+            axis=alt.Axis(format="%m/%Y", labelAngle=0, grid=False)
+        ),
+        y=alt.Y("Importo:Q", title="EUR", axis=alt.Axis(format=",.0f")),
+        color=alt.Color(
+            "Direzione:N",
+            scale=alt.Scale(
+                domain=direzioni,
+                range=[colori[d] for d in direzioni]
+            ),
+            legend=alt.Legend(title=None, orient="top")
+        ),
+        opacity=alt.Opacity(
+            "Stato:N",
+            scale=alt.Scale(domain=["Avvenuto", "Previsto"], range=[1.0, 0.5]),
+            legend=alt.Legend(
+                title=None, orient="top", symbolFillColor="#8a8983"
+            )
+        ),
+        tooltip=[
+            alt.Tooltip("Data:T", format="%d/%m/%Y"),
+            alt.Tooltip("Tipo:N"),
+            alt.Tooltip("Stato:N"),
+            alt.Tooltip("Importo:Q", title="Importo (EUR)", format=",.2f")
+        ]
+    )
+
+    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(
+        color="#8a8983"
+    ).encode(y="y:Q")
+
+    df_oggi = pd.DataFrame({"Data": [pd.Timestamp(oggi)], "Testo": ["oggi"]})
+
+    linea_oggi = alt.Chart(df_oggi).mark_rule(
+        color="#8a8983", strokeDash=[4, 4]
+    ).encode(x=alt.X("Data:T", scale=asse_x))
+
+    testo_oggi = alt.Chart(df_oggi).mark_text(
+        align="left", baseline="top", dx=4, dy=4, color="#8a8983"
+    ).encode(
+        x=alt.X("Data:T", scale=asse_x),
+        y=alt.value(0),
+        text="Testo:N"
+    )
+
+    return (barre + zero + linea_oggi + testo_oggi).properties(height=280)
 
 
 # ============================================================
@@ -1700,9 +1887,10 @@ if "_notifica" in st.session_state:
     st.success(st.session_state.pop("_notifica"))
 
 
-tab1, tab_rend, tab2, tab3, tab4 = st.tabs([
+tab1, tab_rend, tab_flussi, tab2, tab3, tab4 = st.tabs([
     "📊 Registro Transazioni",
     "📈 Rendimenti",
+    "💶 Flussi di cassa",
     "➕ Registra Movimento",
     "🎫 Anagrafica Titoli",
     "🆕 Nuovo Titolo"
@@ -2280,6 +2468,176 @@ with tab_rend:
   tabella; le chiuse fino alla data dell'ultimo movimento.
                 """
             )
+
+
+# ============================================================
+# FLUSSI DI CASSA
+# ============================================================
+
+with tab_flussi:
+
+    st.subheader("💶 Flussi di cassa per titolo")
+
+    df_mov_flussi = ottieni_movimenti_rendimenti()
+
+    if df_mov_flussi.empty:
+
+        st.info("Nessun movimento presente nel database.")
+
+    else:
+
+        oggi_flussi = date.today()
+
+        df_titoli_flussi = ottieni_titoli()
+        df_titoli_flussi = df_titoli_flussi[
+            df_titoli_flussi["isin"].isin(df_mov_flussi["isin"])
+        ]
+
+        col_netto, col_aperti = st.columns(2)
+
+        with col_netto:
+            al_netto = st.toggle(
+                "Importi al netto delle imposte",
+                value=True,
+                key="flussi_netto"
+            )
+
+        with col_aperti:
+            solo_aperti = st.toggle(
+                "Solo posizioni aperte",
+                value=False,
+                key="flussi_aperti"
+            )
+
+        colonna_importo = "Netto" if al_netto else "Lordo"
+
+        st.caption(
+            "Entrate sopra lo zero, uscite sotto, raggruppate per mese. "
+            "I flussi avvenuti sono quelli registrati; i flussi previsti "
+            "(più chiari) sono le cedole future e il rimborso a 100 "
+            "della quantità in portafoglio, calcolati per le "
+            "obbligazioni con scadenza e cedola in anagrafica. Al netto: "
+            "ritenute registrate e, per i flussi previsti, imposte "
+            "stimate all'aliquota del titolo."
+        )
+
+        movimenti_per_titolo_flussi = {
+            isin: gruppo
+            for isin, gruppo in df_mov_flussi.groupby("isin", sort=False)
+        }
+
+        for _, titolo in df_titoli_flussi.iterrows():
+
+            movimenti = movimenti_per_titolo_flussi[titolo["isin"]]
+            analisi = analizza_titolo(
+                movimenti,
+                titolo["prezzo_percentuale"],
+                titolo["tassazione_pct"],
+                oggi=oggi_flussi
+            )
+
+            if solo_aperti and not analisi["aperta"]:
+                continue
+
+            obbligazione_in_corso = (
+                dati_obbligazione_completi(titolo)
+                and titolo["data_scadenza"] > oggi_flussi
+            )
+
+            # Il cambio serve solo per convertire i flussi previsti
+            cambio = None
+            note = []
+
+            if analisi["aperta"] and obbligazione_in_corso:
+
+                if titolo["valuta"] == "EUR":
+                    cambio = 1.0
+                else:
+                    cambio, data_cambio = cambio_online(titolo["valuta"])
+
+                    if cambio:
+                        note.append(
+                            "Flussi previsti convertiti al cambio "
+                            f"{cambio:,.4f} {titolo['valuta']}/EUR"
+                            + (
+                                f" del {data_cambio:%d/%m/%Y}"
+                                if data_cambio else ""
+                            )
+                            + ", ipotizzato invariato fino a scadenza."
+                        )
+                    else:
+                        cambio = float(movimenti["cambio"].iloc[-1])
+                        note.append(
+                            "Cambio online non disponibile: flussi "
+                            "previsti convertiti all'ultimo cambio "
+                            f"registrato ({cambio:,.4f} "
+                            f"{titolo['valuta']}/EUR)."
+                        )
+
+            elif analisi["aperta"] and titolo["prezzo_percentuale"]:
+                note.append(
+                    "Flussi previsti non calcolati: titolo scaduto "
+                    "oppure scadenza e cedola mancanti in anagrafica."
+                )
+
+            elif analisi["aperta"]:
+                note.append(
+                    "Titolo senza scadenza: dividendi e vendita futuri "
+                    "non sono prevedibili."
+                )
+
+            df_flussi = flussi_cassa_titolo(
+                titolo, movimenti, analisi, cambio, oggi_flussi
+            )
+            df_flussi["Importo"] = df_flussi[colonna_importo]
+
+            importi = df_flussi["Importo"]
+            avvenuti = df_flussi["Stato"] == "Avvenuto"
+
+            st.divider()
+            st.markdown(f"#### {etichetta_titolo(titolo)}")
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Uscite", f"{-importi[importi < 0].sum():,.2f} €")
+            c2.metric(
+                "Entrate avvenute",
+                f"{importi[avvenuti & (importi > 0)].sum():,.2f} €"
+            )
+            c3.metric(
+                "Entrate previste",
+                f"{importi[~avvenuti & (importi > 0)].sum():,.2f} €"
+            )
+            c4.metric(
+                "Saldo a scadenza" if (~avvenuti).any() else "Saldo",
+                f"{importi.sum():,.2f} €"
+            )
+
+            st.altair_chart(
+                grafico_flussi(
+                    df_flussi,
+                    oggi_flussi,
+                    getattr(st.context.theme, "type", None) or "light"
+                ),
+                width="stretch"
+            )
+
+            for nota in note:
+                st.caption(nota)
+
+            with st.expander("Dettaglio flussi"):
+                st.dataframe(
+                    df_flussi[["Data", "Tipo", "Stato", "Importo"]]
+                    .sort_values("Data")
+                    .rename(columns={"Importo": "Importo (EUR)"}),
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "Data": st.column_config.DateColumn(
+                            format="DD/MM/YYYY"
+                        ),
+                        "Importo (EUR)": COLONNA_EURO
+                    }
+                )
 
 
 # ============================================================
