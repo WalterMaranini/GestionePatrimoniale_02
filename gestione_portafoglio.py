@@ -1212,20 +1212,45 @@ def campi_movimento(prefisso, titolo, default=None, n_colonne=3):
     valuta = titolo["valuta"]
     percentuale = bool(titolo["prezzo_percentuale"])
 
-    # 9 campi distribuiti in ordine sulle colonne disponibili
+    # Il tipo operazione si legge dallo stato prima di disegnare i
+    # campi, perché da esso dipende quali campi mostrare.
+    solo_cedola = (
+        st.session_state.get(f"{prefisso}_op", d["operazione"])
+        == "Cedola/Dividendo"
+    )
+
+    # Per cedole/dividendi quantità, prezzo, cambio, commissioni e
+    # rateo non sono pertinenti: non vengono mostrati e si salvano
+    # a zero (cambio 1).
+    campi = (
+        ["data", "op"]
+        + ([] if solo_cedola else ["qta", "prezzo", "cambio", "comm", "rateo"])
+        + ["cedola", "ritenuta"]
+    )
+
+    # Campi distribuiti in ordine sulle colonne disponibili
     colonne = st.columns(n_colonne)
-    posti = [colonne[i * n_colonne // 9] for i in range(9)]
+    posto = {
+        campo: colonne[i * n_colonne // len(campi)]
+        for i, campo in enumerate(campi)
+    }
 
-    v = {}
+    v = {
+        "quantita": 0.0,
+        "prezzo": 0.0,
+        "cambio": 1.0,
+        "commissioni": 0.0,
+        "rateo": 0.0
+    }
 
-    with posti[0]:
+    with posto["data"]:
         v["data_it"] = st.text_input(
             "Data Operazione (gg/mm/aaaa)",
             value=d["data_it"],
             key=f"{prefisso}_data"
         )
 
-    with posti[1]:
+    with posto["op"]:
         v["operazione"] = st.selectbox(
             "Tipo Operazione",
             OPERAZIONI,
@@ -1233,61 +1258,63 @@ def campi_movimento(prefisso, titolo, default=None, n_colonne=3):
             key=f"{prefisso}_op"
         )
 
-    with posti[2]:
-        v["quantita"] = st.number_input(
-            "Valore nominale" if percentuale else "Quantità",
-            min_value=0.0,
-            step=100.0,
-            value=float(d["quantita"]),
-            key=f"{prefisso}_qta"
-        )
+    if not solo_cedola:
 
-    with posti[3]:
-        v["prezzo"] = st.number_input(
-            f"Prezzo (% del nominale, {valuta})"
-            if percentuale
-            else f"Prezzo in valuta ({valuta})",
-            min_value=0.0,
-            format="%.5f",
-            value=float(d["prezzo"]),
-            key=f"{prefisso}_prezzo"
-        )
-
-    with posti[4]:
-        if valuta == "EUR":
-            v["cambio"] = st.number_input(
-                "Tasso di Cambio",
-                value=1.0,
-                disabled=True,
-                key=f"{prefisso}_cambio_eur"
-            )
-        else:
-            v["cambio"] = st.number_input(
-                f"Tasso di Cambio ({valuta} per 1 EUR)",
-                min_value=0.0001,
-                format="%.4f",
-                value=max(float(d["cambio"]), 0.0001),
-                key=f"{prefisso}_cambio"
+        with posto["qta"]:
+            v["quantita"] = st.number_input(
+                "Valore nominale" if percentuale else "Quantità",
+                min_value=0.0,
+                step=100.0,
+                value=float(d["quantita"]),
+                key=f"{prefisso}_qta"
             )
 
-    with posti[5]:
-        v["commissioni"] = st.number_input(
-            "Commissioni operative (EUR)",
-            min_value=0.0,
-            step=1.0,
-            value=float(d["commissioni"]),
-            key=f"{prefisso}_comm"
-        )
+        with posto["prezzo"]:
+            v["prezzo"] = st.number_input(
+                f"Prezzo (% del nominale, {valuta})"
+                if percentuale
+                else f"Prezzo in valuta ({valuta})",
+                min_value=0.0,
+                format="%.5f",
+                value=float(d["prezzo"]),
+                key=f"{prefisso}_prezzo"
+            )
 
-    with posti[6]:
-        v["rateo"] = st.number_input(
-            "Rateo (EUR)",
-            step=1.0,
-            value=float(d["rateo"]),
-            key=f"{prefisso}_rateo"
-        )
+        with posto["cambio"]:
+            if valuta == "EUR":
+                v["cambio"] = st.number_input(
+                    "Tasso di Cambio",
+                    value=1.0,
+                    disabled=True,
+                    key=f"{prefisso}_cambio_eur"
+                )
+            else:
+                v["cambio"] = st.number_input(
+                    f"Tasso di Cambio ({valuta} per 1 EUR)",
+                    min_value=0.0001,
+                    format="%.4f",
+                    value=max(float(d["cambio"]), 0.0001),
+                    key=f"{prefisso}_cambio"
+                )
 
-    with posti[7]:
+        with posto["comm"]:
+            v["commissioni"] = st.number_input(
+                "Commissioni operative (EUR)",
+                min_value=0.0,
+                step=1.0,
+                value=float(d["commissioni"]),
+                key=f"{prefisso}_comm"
+            )
+
+        with posto["rateo"]:
+            v["rateo"] = st.number_input(
+                "Rateo (EUR)",
+                step=1.0,
+                value=float(d["rateo"]),
+                key=f"{prefisso}_rateo"
+            )
+
+    with posto["cedola"]:
         v["cedola"] = st.number_input(
             "Cedola / Dividendo lordo (EUR)",
             min_value=0.0,
@@ -1296,7 +1323,7 @@ def campi_movimento(prefisso, titolo, default=None, n_colonne=3):
             key=f"{prefisso}_cedola"
         )
 
-    with posti[8]:
+    with posto["ritenuta"]:
         v["ritenuta"] = st.number_input(
             "Ritenuta / Tasse (EUR)",
             max_value=0.0,
@@ -1327,17 +1354,27 @@ def campi_movimento(prefisso, titolo, default=None, n_colonne=3):
 
         c1, c2 = st.columns(2)
 
-        with c1:
-            st.metric(
-                "Importo operazione",
-                f"{importo_preview:,.2f} €"
-            )
+        if solo_cedola:
 
-        with c2:
-            st.metric(
-                "Totale valore",
-                f"{totale_preview:,.2f} €"
-            )
+            with c1:
+                st.metric(
+                    "Importo netto incassato",
+                    f"{totale_preview:,.2f} €"
+                )
+
+        else:
+
+            with c1:
+                st.metric(
+                    "Importo operazione",
+                    f"{importo_preview:,.2f} €"
+                )
+
+            with c2:
+                st.metric(
+                    "Totale valore",
+                    f"{totale_preview:,.2f} €"
+                )
 
     except ValueError as e:
 
