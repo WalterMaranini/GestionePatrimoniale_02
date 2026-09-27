@@ -18,6 +18,10 @@ TIPI_PREZZO = {
     True: "Percentuale del nominale (obbligazioni)"
 }
 
+# Aliquota sui redditi di capitale e sui capital gain: 26% ordinaria,
+# 12,5% per titoli di Stato italiani ed emittenti "white list".
+TASSAZIONE_DEFAULT = 26.0
+
 COLONNE_TX = (
     "isin",
     "data",
@@ -60,7 +64,12 @@ COLONNE_TITOLI = {
     "isin": st.column_config.TextColumn("ISIN"),
     "nome_asset": st.column_config.TextColumn("Strumento"),
     "valuta": st.column_config.TextColumn("Valuta"),
-    "prezzo_percentuale": st.column_config.CheckboxColumn("Prezzo in %")
+    "prezzo_percentuale": st.column_config.CheckboxColumn("Prezzo in %"),
+    "tassazione_pct": st.column_config.NumberColumn(
+        "Tassazione %",
+        format="%.2f %%"
+    ),
+    "ticker": st.column_config.TextColumn("Ticker")
 }
 
 
@@ -92,22 +101,30 @@ def inizializza_db():
                 isin TEXT PRIMARY KEY,
                 nome_asset TEXT NOT NULL,
                 valuta TEXT NOT NULL,
-                prezzo_percentuale INTEGER NOT NULL DEFAULT 0
+                prezzo_percentuale INTEGER NOT NULL DEFAULT 0,
+                tassazione_pct REAL NOT NULL DEFAULT {TASSAZIONE_DEFAULT},
+                ticker TEXT
             )
-        """)
+        """.format(TASSAZIONE_DEFAULT=TASSAZIONE_DEFAULT))
 
         # Migrazione dei database creati prima dell'introduzione
-        # del tipo di quotazione.
+        # delle colonne aggiunte in seguito.
         colonne_titoli = [
             riga[1]
             for riga in cursor.execute("PRAGMA table_info(titoli)")
         ]
 
-        if "prezzo_percentuale" not in colonne_titoli:
-            cursor.execute("""
-                ALTER TABLE titoli
-                ADD COLUMN prezzo_percentuale INTEGER NOT NULL DEFAULT 0
-            """)
+        colonne_aggiunte = {
+            "prezzo_percentuale": "INTEGER NOT NULL DEFAULT 0",
+            "tassazione_pct": f"REAL NOT NULL DEFAULT {TASSAZIONE_DEFAULT}",
+            "ticker": "TEXT"
+        }
+
+        for colonna, definizione in colonne_aggiunte.items():
+            if colonna not in colonne_titoli:
+                cursor.execute(
+                    f"ALTER TABLE titoli ADD COLUMN {colonna} {definizione}"
+                )
 
         cursor.execute(
             SQL_CREA_TRANSAZIONI.format(nome="IF NOT EXISTS transazioni")
@@ -277,7 +294,8 @@ def ottieni_titoli():
     with get_connection() as conn:
         df = pd.read_sql_query(
             """
-            SELECT isin, nome_asset, valuta, prezzo_percentuale
+            SELECT isin, nome_asset, valuta, prezzo_percentuale,
+                   tassazione_pct, ticker
             FROM titoli
             ORDER BY nome_asset ASC
             """,
@@ -285,6 +303,7 @@ def ottieni_titoli():
         )
 
     df["prezzo_percentuale"] = df["prezzo_percentuale"].astype(bool)
+    df["ticker"] = df["ticker"].fillna("")
     return df
 
 
@@ -440,7 +459,23 @@ def calcola_valori_finanziari(
 # TITOLI
 # ============================================================
 
-def inserisci_titolo(isin, nome_asset, valuta, prezzo_percentuale):
+def tassazione_valida(tassazione_pct):
+    return 0 <= float(tassazione_pct) <= 100
+
+
+def normalizza_ticker(ticker):
+    """Ticker Yahoo Finance facoltativo: stringa vuota -> None."""
+    return (ticker or "").strip().upper() or None
+
+
+def inserisci_titolo(
+    isin,
+    nome_asset,
+    valuta,
+    prezzo_percentuale,
+    tassazione_pct,
+    ticker=""
+):
 
     isin = isin.strip().upper()
     nome_asset = nome_asset.strip()
@@ -455,6 +490,9 @@ def inserisci_titolo(isin, nome_asset, valuta, prezzo_percentuale):
     if not nome_asset:
         return False, "Il nome dello strumento è obbligatorio."
 
+    if not tassazione_valida(tassazione_pct):
+        return False, "La tassazione deve essere compresa tra 0 e 100%."
+
     try:
         with get_connection() as conn:
             conn.execute(
@@ -463,15 +501,19 @@ def inserisci_titolo(isin, nome_asset, valuta, prezzo_percentuale):
                     isin,
                     nome_asset,
                     valuta,
-                    prezzo_percentuale
+                    prezzo_percentuale,
+                    tassazione_pct,
+                    ticker
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     isin,
                     nome_asset,
                     valuta,
-                    int(prezzo_percentuale)
+                    int(prezzo_percentuale),
+                    float(tassazione_pct),
+                    normalizza_ticker(ticker)
                 )
             )
 
@@ -536,7 +578,9 @@ def aggiorna_titolo(
     nuovo_isin,
     nome_asset,
     valuta,
-    prezzo_percentuale
+    prezzo_percentuale,
+    tassazione_pct,
+    ticker=""
 ):
     """
     Modifica un titolo esistente. Se cambia il tipo di quotazione,
@@ -553,6 +597,9 @@ def aggiorna_titolo(
 
     if not nome_asset:
         return False, "Il nome dello strumento è obbligatorio."
+
+    if not tassazione_valida(tassazione_pct):
+        return False, "La tassazione deve essere compresa tra 0 e 100%."
 
     try:
         with get_connection() as conn:
@@ -574,7 +621,8 @@ def aggiorna_titolo(
                 """
                 UPDATE titoli
                 SET isin = ?, nome_asset = ?, valuta = ?,
-                    prezzo_percentuale = ?
+                    prezzo_percentuale = ?, tassazione_pct = ?,
+                    ticker = ?
                 WHERE isin = ?
                 """,
                 (
@@ -582,6 +630,8 @@ def aggiorna_titolo(
                     nome_asset,
                     valuta,
                     int(prezzo_percentuale),
+                    float(tassazione_pct),
+                    normalizza_ticker(ticker),
                     isin_originale
                 )
             )
@@ -784,6 +834,344 @@ def elimina_transazione(id_tx):
 
 
 # ============================================================
+# RENDIMENTI
+# ============================================================
+
+def ottieni_movimenti_rendimenti():
+    """Tutti i movimenti in ordine cronologico, con i dati del titolo."""
+    with get_connection() as conn:
+        return pd.read_sql_query(
+            """
+            SELECT
+                t.id, t.isin, t.data, t.operazione, t.quantita,
+                t.prezzo_valuta, t.cambio, t.importo_euro,
+                t.commissioni_eur, t.rateo_eur, t.cedola_eur,
+                t.ritenuta_eur, t.totale_valore_eur
+            FROM transazioni t
+            ORDER BY t.data ASC, t.id ASC
+            """,
+            conn
+        )
+
+
+def xirr(flussi):
+    """
+    Tasso interno di rendimento annuo di una serie di flussi
+    [(data, importo)], con giorni/365 (come XIRR di Excel).
+    Restituisce None se il tasso non è definito (flussi tutti
+    dello stesso segno).
+    """
+    if not flussi:
+        return None
+
+    if not (
+        any(v < 0 for _, v in flussi)
+        and any(v > 0 for _, v in flussi)
+    ):
+        return None
+
+    d0 = min(d for d, _ in flussi)
+
+    def van(tasso):
+        return sum(
+            v / (1 + tasso) ** ((d - d0).days / 365.0)
+            for d, v in flussi
+        )
+
+    basso, alto = -0.9999, 1.0
+
+    while van(basso) * van(alto) > 0 and alto < 1e6:
+        alto *= 2
+
+    if van(basso) * van(alto) > 0:
+        return None
+
+    for _ in range(200):
+        medio = (basso + alto) / 2
+
+        if van(basso) * van(medio) <= 0:
+            alto = medio
+        else:
+            basso = medio
+
+    return (basso + alto) / 2
+
+
+def segno_flusso(operazione):
+    """Acquisto = uscita di cassa, vendita e cedola = entrata."""
+    return -1 if operazione == "Acquisto" else 1
+
+
+def analizza_titolo(
+    movimenti,
+    prezzo_percentuale,
+    tassazione_pct,
+    prezzo_attuale=None,
+    cambio_attuale=None,
+    oggi=None
+):
+    """
+    Calcola risultati e indici di rendimento di un titolo a partire
+    dai suoi movimenti (ordine cronologico) e, per la parte ancora
+    in portafoglio, dal prezzo e cambio attuali.
+
+    Metodo del costo medio ponderato. Il carico è tenuto in tre
+    modi per separare gli effetti:
+    - "eur": importo + commissioni in EUR (risultato effettivo)
+    - "imp": solo importo in EUR (per l'effetto cambio)
+    - "val": importo in valuta del titolo (variazione di prezzo)
+
+    Le imposte sul capital gain sono una stima: aliquota del titolo
+    sulle plusvalenze, senza compensazione con minusvalenze.
+    """
+    oggi = oggi or datetime.today().date()
+    aliquota = float(tassazione_pct) / 100
+    moltiplicatore = 0.01 if prezzo_percentuale else 1.0
+
+    quantita = 0.0
+    carico = {"eur": 0.0, "imp": 0.0, "val": 0.0}
+    investito = {"eur": 0.0, "imp": 0.0, "val": 0.0}
+    guadagno = {"eur": 0.0, "imp": 0.0, "val": 0.0}
+
+    redditi_lordi = 0.0      # cedole + ratei incassati - ratei pagati
+    ritenute = 0.0           # negative, come registrate
+    imposte_cg = 0.0
+    flussi_lordi = []        # prima di ritenute e imposte
+    flussi_netti = []        # dopo ritenute e imposte stimate
+    avvisi = []
+    prima_data = None
+    ultima_data = None
+
+    for m in movimenti.itertuples():
+
+        data = datetime.strptime(m.data, "%Y-%m-%d").date()
+        prima_data = prima_data or data
+        ultima_data = data
+
+        ritenute += m.ritenuta_eur
+        valore_valuta = m.quantita * m.prezzo_valuta * moltiplicatore
+        imposta = 0.0
+
+        if m.operazione == "Acquisto":
+
+            costi = {
+                "eur": m.importo_euro + m.commissioni_eur,
+                "imp": m.importo_euro,
+                "val": valore_valuta
+            }
+
+            for k in carico:
+                carico[k] += costi[k]
+                investito[k] += costi[k]
+
+            quantita += m.quantita
+            redditi_lordi -= m.rateo_eur
+
+        elif m.operazione == "Vendita":
+
+            if m.quantita > quantita + 1e-9:
+                avvisi.append(
+                    f"La vendita del {data:%d/%m/%Y} supera la "
+                    "quantità in portafoglio."
+                )
+
+            frazione = min(m.quantita / quantita, 1.0) if quantita > 0 else 0.0
+
+            ricavi = {
+                "eur": m.importo_euro - m.commissioni_eur,
+                "imp": m.importo_euro,
+                "val": valore_valuta
+            }
+
+            for k in carico:
+                costo_venduto = carico[k] * frazione
+                if k == "eur":
+                    imposta = max(ricavi[k] - costo_venduto, 0.0) * aliquota
+                guadagno[k] += ricavi[k] - costo_venduto
+                carico[k] -= costo_venduto
+
+            imposte_cg += imposta
+            quantita = max(quantita - m.quantita, 0.0)
+            redditi_lordi += m.rateo_eur
+
+        else:
+            redditi_lordi += m.cedola_eur
+
+        segno = segno_flusso(m.operazione)
+
+        flussi_lordi.append(
+            (data, segno * (m.totale_valore_eur - m.ritenuta_eur))
+        )
+        flussi_netti.append(
+            (data, segno * m.totale_valore_eur - imposta)
+        )
+
+    aperta = quantita > 1e-9
+    valutata = True
+    valore_attuale = 0.0
+    realizzato_eur = guadagno["eur"]
+    latente_eur = 0.0
+
+    if aperta:
+
+        if prezzo_attuale and cambio_attuale:
+
+            valore_valuta = quantita * prezzo_attuale * moltiplicatore
+            valore = {
+                "eur": valore_valuta / cambio_attuale,
+                "imp": valore_valuta / cambio_attuale,
+                "val": valore_valuta
+            }
+
+            for k in guadagno:
+                guadagno[k] += valore[k] - carico[k]
+
+            valore_attuale = valore["eur"]
+            latente_eur = valore["eur"] - carico["eur"]
+            imposta_latente = max(latente_eur, 0.0) * aliquota
+            imposte_cg += imposta_latente
+
+            flussi_lordi.append((oggi, valore_attuale))
+            flussi_netti.append((oggi, valore_attuale - imposta_latente))
+
+        else:
+            valutata = False
+
+    fine = oggi if aperta else ultima_data
+    anni = (fine - prima_data).days / 365.0 if prima_data else 0.0
+
+    def quota(numeratore, denominatore):
+        return numeratore / denominatore if denominatore else None
+
+    risultato = {
+        "quantita_aperta": quantita,
+        "aperta": aperta,
+        "valutata": valutata,
+        "anni": anni,
+        "investito": investito["eur"],
+        "carico_residuo": carico["eur"],
+        "valore_attuale": valore_attuale if valutata else None,
+        "pl_realizzato": realizzato_eur,
+        "pl_latente": latente_eur if valutata else None,
+        "redditi_lordi": redditi_lordi,
+        "ritenute": ritenute,
+        "imposte_cg": imposte_cg if valutata else None,
+        "flussi_lordi": flussi_lordi,
+        "flussi_netti": flussi_netti,
+        "avvisi": avvisi
+    }
+
+    if valutata:
+        lordo = guadagno["eur"] + redditi_lordi
+        netto = lordo + ritenute - imposte_cg
+        var_eur = quota(guadagno["imp"], investito["imp"])
+        var_valuta = quota(guadagno["val"], investito["val"])
+
+        risultato.update({
+            "risultato_lordo": lordo,
+            "risultato_netto": netto,
+            "rend_lordo": quota(lordo, investito["eur"]),
+            "rend_netto": quota(netto, investito["eur"]),
+            "xirr_lordo": xirr(flussi_lordi),
+            "xirr_netto": xirr(flussi_netti),
+            "var_prezzo_valuta": var_valuta,
+            "effetto_cambio": (
+                var_eur - var_valuta
+                if var_eur is not None and var_valuta is not None
+                else None
+            ),
+            "proventi_annui": (
+                quota(redditi_lordi + ritenute, investito["eur"]) / anni
+                if anni > 0 and investito["eur"]
+                else None
+            )
+        })
+
+    return risultato
+
+
+# ------------------------------------------------------------
+# PREZZI ONLINE (Yahoo Finance)
+# ------------------------------------------------------------
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def ticker_da_isin(isin):
+    """Cerca su Yahoo Finance il simbolo corrispondente a un ISIN."""
+    try:
+        import yfinance as yf
+        risultati = yf.Search(isin, max_results=1).quotes
+        return risultati[0]["symbol"] if risultati else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def quotazione_online(ticker):
+    """
+    Ultimo prezzo di chiusura disponibile: dict con prezzo, valuta
+    e data, oppure None se il simbolo non è disponibile.
+    """
+    try:
+        import yfinance as yf
+        titolo = yf.Ticker(ticker)
+        storico = titolo.history(period="1mo")
+
+        if storico.empty:
+            return None
+
+        prezzo = float(storico["Close"].iloc[-1])
+        valuta = getattr(titolo.fast_info, "currency", None)
+
+        # Le azioni di Londra sono quotate in pence
+        if valuta in ("GBp", "GBX"):
+            prezzo /= 100
+            valuta = "GBP"
+
+        return {
+            "prezzo": prezzo,
+            "valuta": valuta,
+            "data": storico.index[-1].date()
+        }
+
+    except Exception:
+        return None
+
+
+def cambio_online(valuta):
+    """Unità di valuta per 1 EUR, la stessa convenzione dei movimenti."""
+    if valuta == "EUR":
+        return 1.0
+
+    quotazione = quotazione_online(f"EUR{valuta}=X")
+    return quotazione["prezzo"] if quotazione else None
+
+
+def valutazione_online(titolo):
+    """
+    Prezzo e cambio attuali di un titolo da Yahoo Finance, con
+    l'indicazione della fonte da mostrare all'utente.
+    """
+    ticker = titolo["ticker"] or ticker_da_isin(titolo["isin"])
+    cambio = cambio_online(titolo["valuta"])
+
+    if not ticker:
+        return None, cambio, "", None, "Non trovato online"
+
+    quotazione = quotazione_online(ticker)
+
+    if quotazione is None:
+        return None, cambio, ticker, None, "Prezzo non disponibile"
+
+    if quotazione["valuta"] and quotazione["valuta"] != titolo["valuta"]:
+        return (
+            None, cambio, ticker, None,
+            f"Quotato in {quotazione['valuta']}, non {titolo['valuta']}"
+        )
+
+    return quotazione["prezzo"], cambio, ticker, quotazione["data"], "Online"
+
+
+# ============================================================
 # MODULO MOVIMENTO (condiviso da inserimento e modifica)
 # ============================================================
 
@@ -973,8 +1361,9 @@ if "_notifica" in st.session_state:
     st.success(st.session_state.pop("_notifica"))
 
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab_rend, tab2, tab3, tab4 = st.tabs([
     "📊 Registro Transazioni",
+    "📈 Rendimenti",
     "➕ Registra Movimento",
     "🎫 Anagrafica Titoli",
     "🆕 Nuovo Titolo"
@@ -1185,6 +1574,295 @@ with tab1:
 
 
 # ============================================================
+# TAB RENDIMENTI
+# ============================================================
+
+def percentuale(valore):
+    return None if valore is None else valore * 100
+
+
+COLONNA_EURO = st.column_config.NumberColumn(format="%.2f €")
+COLONNA_PCT = st.column_config.NumberColumn(format="%.2f %%")
+
+with tab_rend:
+
+    st.subheader("📈 Rendimento degli investimenti")
+
+    df_mov_rend = ottieni_movimenti_rendimenti()
+
+    if df_mov_rend.empty:
+
+        st.info("Nessun movimento presente nel database.")
+
+    else:
+
+        df_titoli_rend = ottieni_titoli()
+        df_titoli_rend = df_titoli_rend[
+            df_titoli_rend["isin"].isin(df_mov_rend["isin"])
+        ]
+
+        movimenti_per_titolo = {
+            isin: gruppo
+            for isin, gruppo in df_mov_rend.groupby("isin", sort=False)
+        }
+
+        def analizza(titolo, prezzo=None, cambio=None):
+            return analizza_titolo(
+                movimenti_per_titolo[titolo["isin"]],
+                titolo["prezzo_percentuale"],
+                titolo["tassazione_pct"],
+                prezzo,
+                cambio
+            )
+
+        # Prima passata senza prezzi: serve a sapere quali
+        # posizioni sono ancora aperte e per quale quantità.
+        analisi_base = {
+            titolo["isin"]: analizza(titolo)
+            for _, titolo in df_titoli_rend.iterrows()
+        }
+
+        # ----------------------------------------------------
+        # VALUTAZIONE POSIZIONI APERTE
+        # ----------------------------------------------------
+
+        titoli_aperti = df_titoli_rend[
+            [analisi_base[i]["aperta"] for i in df_titoli_rend["isin"]]
+        ]
+
+        valutazioni = {}
+
+        if not titoli_aperti.empty:
+
+            col_titolo, col_bottone = st.columns([4, 1])
+
+            with col_titolo:
+                st.markdown("#### Valutazione delle posizioni aperte")
+
+            with col_bottone:
+                if st.button("🔄 Aggiorna prezzi", key="rend_aggiorna"):
+                    ticker_da_isin.clear()
+                    quotazione_online.clear()
+                    st.session_state.pop("rend_editor", None)
+
+            righe_valutazione = []
+
+            with st.spinner("Recupero prezzi da Yahoo Finance..."):
+                for _, titolo in titoli_aperti.iterrows():
+                    prezzo, cambio, ticker, data_prezzo, fonte = (
+                        valutazione_online(titolo)
+                    )
+                    righe_valutazione.append({
+                        "ISIN": titolo["isin"],
+                        "Strumento": titolo["nome_asset"],
+                        "Ticker": ticker,
+                        "Quantità": analisi_base[titolo["isin"]]["quantita_aperta"],
+                        "Valuta": titolo["valuta"],
+                        "Prezzo attuale": prezzo,
+                        "Cambio": cambio,
+                        "Data prezzo": data_prezzo,
+                        "Fonte": fonte
+                    })
+
+            st.caption(
+                "Prezzo e cambio si possono correggere o inserire "
+                "direttamente in tabella (restano validi fino alla "
+                "chiusura della pagina). Per le obbligazioni il prezzo "
+                "è in % del nominale; il cambio è in unità di valuta "
+                "per 1 EUR."
+            )
+
+            df_valutazione = st.data_editor(
+                pd.DataFrame(righe_valutazione),
+                key="rend_editor",
+                hide_index=True,
+                width="stretch",
+                disabled=[
+                    "ISIN", "Strumento", "Ticker", "Quantità",
+                    "Valuta", "Data prezzo", "Fonte"
+                ],
+                column_config={
+                    "Quantità": st.column_config.NumberColumn(format="%.2f"),
+                    "Prezzo attuale": st.column_config.NumberColumn(
+                        min_value=0.0, format="%.4f"
+                    ),
+                    "Cambio": st.column_config.NumberColumn(
+                        min_value=0.0001, format="%.4f"
+                    ),
+                    "Data prezzo": st.column_config.DateColumn(
+                        format="DD/MM/YYYY"
+                    )
+                }
+            )
+
+            for _, riga in df_valutazione.iterrows():
+                prezzo = riga["Prezzo attuale"]
+                cambio = 1.0 if riga["Valuta"] == "EUR" else riga["Cambio"]
+                valutazioni[riga["ISIN"]] = (
+                    None if pd.isna(prezzo) else float(prezzo),
+                    None if pd.isna(cambio) else float(cambio)
+                )
+
+        # ----------------------------------------------------
+        # CALCOLO
+        # ----------------------------------------------------
+
+        analisi = {}
+
+        for _, titolo in df_titoli_rend.iterrows():
+            prezzo, cambio = valutazioni.get(titolo["isin"], (None, None))
+            analisi[titolo["isin"]] = analizza(titolo, prezzo, cambio)
+
+        for _, titolo in df_titoli_rend.iterrows():
+            for avviso in analisi[titolo["isin"]]["avvisi"]:
+                st.warning(f"{titolo['nome_asset']}: {avviso}")
+
+        non_valutati = [
+            titolo["nome_asset"]
+            for _, titolo in df_titoli_rend.iterrows()
+            if not analisi[titolo["isin"]]["valutata"]
+        ]
+
+        # ----------------------------------------------------
+        # RIEPILOGO PORTAFOGLIO
+        # ----------------------------------------------------
+
+        st.markdown("#### Portafoglio")
+
+        if non_valutati:
+
+            st.warning(
+                "Manca il prezzo attuale di: "
+                + ", ".join(non_valutati)
+                + ". Inseriscilo nella tabella sopra per calcolare "
+                "i rendimenti di questi titoli e del portafoglio."
+            )
+
+        else:
+
+            investito_tot = sum(a["investito"] for a in analisi.values())
+            valore_tot = sum(a["valore_attuale"] for a in analisi.values())
+            netto_tot = sum(a["risultato_netto"] for a in analisi.values())
+            xirr_tot = xirr([
+                flusso
+                for a in analisi.values()
+                for flusso in a["flussi_netti"]
+            ])
+
+            k1, k2, k3, k4 = st.columns(4)
+
+            k1.metric("Capitale investito", f"{investito_tot:,.2f} €")
+            k2.metric("Valore attuale", f"{valore_tot:,.2f} €")
+            k3.metric(
+                "Risultato netto",
+                f"{netto_tot:,.2f} €",
+                f"{netto_tot / investito_tot:.2%}" if investito_tot else None
+            )
+            k4.metric(
+                "Rendimento annuo netto (XIRR)",
+                f"{xirr_tot:.2%}" if xirr_tot is not None else "—"
+            )
+
+        # ----------------------------------------------------
+        # DETTAGLIO PER TITOLO
+        # ----------------------------------------------------
+
+        righe_risultati = []
+        righe_indici = []
+
+        for _, titolo in df_titoli_rend.iterrows():
+
+            a = analisi[titolo["isin"]]
+
+            righe_risultati.append({
+                "Strumento": titolo["nome_asset"],
+                "Stato": "Aperta" if a["aperta"] else "Chiusa",
+                "Investito": a["investito"],
+                "Valore attuale": a["valore_attuale"],
+                "P/L realizzato": a["pl_realizzato"],
+                "P/L latente": a["pl_latente"],
+                "Cedole e ratei lordi": a["redditi_lordi"],
+                "Ritenute": a["ritenute"],
+                "Imposte CG stimate": (
+                    None if a["imposte_cg"] is None else -a["imposte_cg"]
+                ),
+                "Risultato netto": a.get("risultato_netto")
+            })
+
+            righe_indici.append({
+                "Strumento": titolo["nome_asset"],
+                "Durata (anni)": a["anni"],
+                "Rend. lordo %": percentuale(a.get("rend_lordo")),
+                "Rend. netto %": percentuale(a.get("rend_netto")),
+                "XIRR lordo %": percentuale(a.get("xirr_lordo")),
+                "XIRR netto %": percentuale(a.get("xirr_netto")),
+                "Proventi netti % annuo": percentuale(a.get("proventi_annui")),
+                "Var. prezzo in valuta %": percentuale(a.get("var_prezzo_valuta")),
+                "Effetto cambio (punti %)": percentuale(a.get("effetto_cambio"))
+            })
+
+        st.markdown("#### Risultati in euro")
+
+        st.dataframe(
+            pd.DataFrame(righe_risultati),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                colonna: COLONNA_EURO
+                for colonna in righe_risultati[0]
+                if colonna not in ("Strumento", "Stato")
+            }
+        )
+
+        st.markdown("#### Indici di rendimento")
+
+        st.dataframe(
+            pd.DataFrame(righe_indici),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Durata (anni)": st.column_config.NumberColumn(format="%.2f"),
+                **{
+                    colonna: COLONNA_PCT
+                    for colonna in righe_indici[0]
+                    if colonna not in ("Strumento", "Durata (anni)")
+                }
+            }
+        )
+
+        with st.expander("ℹ️ Come leggere gli indici"):
+            st.markdown(
+                """
+- **Investito**: somma degli acquisti (controvalore + commissioni).
+- **P/L realizzato / latente**: plusvalenza (o minusvalenza) sulla
+  parte venduta / ancora in portafoglio, con il metodo del
+  **costo medio ponderato**, commissioni incluse.
+- **Cedole e ratei lordi**: cedole/dividendi incassati + ratei
+  incassati alla vendita − ratei pagati all'acquisto.
+- **Imposte CG stimate**: aliquota del titolo ("Tassazione %")
+  applicata alle plusvalenze realizzate e latenti. È una stima:
+  non considera la compensazione con minusvalenze.
+- **Risultato netto**: P/L + cedole e ratei − ritenute − imposte.
+- **Rend. lordo / netto %**: risultato / capitale investito, non
+  annualizzato.
+- **XIRR**: rendimento annuo composto che tiene conto di **quando**
+  sono avvenuti i flussi (money-weighted). È l'indice più adatto a
+  confrontare investimenti con durate diverse; su periodi brevi
+  (pochi mesi) può risultare molto amplificato.
+- **Proventi netti % annuo**: cedole e ratei netti in rapporto al
+  capitale investito, per anno di detenzione.
+- **Var. prezzo in valuta %**: variazione del capitale misurata
+  nella valuta del titolo, senza commissioni.
+- **Effetto cambio**: differenza (in punti percentuali) tra la
+  variazione del capitale in EUR e quella in valuta: indica quanto
+  il cambio ha aggiunto o tolto al rendimento.
+- Le posizioni aperte sono valutate a oggi con il prezzo della
+  tabella; le chiuse fino alla data dell'ultimo movimento.
+                """
+            )
+
+
+# ============================================================
 # TAB 2
 # REGISTRA MOVIMENTO
 # ============================================================
@@ -1357,6 +2035,8 @@ with tab3:
                 st.write(f"**Descrizione:** {titolo['nome_asset']}")
                 st.write(f"**Valuta:** {titolo['valuta']}")
                 st.write(f"**Prezzo:** {TIPI_PREZZO[bool(titolo['prezzo_percentuale'])]}")
+                st.write(f"**Tassazione:** {titolo['tassazione_pct']:.2f} %")
+                st.write(f"**Ticker:** {titolo['ticker'] or '— (ricerca da ISIN)'}")
 
                 if not valida_isin(titolo["isin"]):
                     st.warning(
@@ -1409,6 +2089,26 @@ with tab3:
                         key=f"modifica_percentuale{suf_titolo}"
                     )
 
+                    modifica_tassazione = st.number_input(
+                        "Tassazione %",
+                        min_value=0.0,
+                        max_value=100.0,
+                        step=0.5,
+                        format="%.2f",
+                        value=float(titolo["tassazione_pct"]),
+                        key=f"modifica_tassazione{suf_titolo}",
+                        help="Aliquota su capital gain e cedole/dividendi "
+                             "(es. 26 ordinaria, 12,5 titoli di Stato)."
+                    )
+
+                    modifica_ticker = st.text_input(
+                        "Ticker (facoltativo)",
+                        value=titolo["ticker"] or "",
+                        key=f"modifica_ticker{suf_titolo}",
+                        help="Simbolo Yahoo Finance per il prezzo online, es. ENI.MI. "
+                             "Se vuoto viene cercato dall'ISIN."
+                    )
+
                     if len(df_movimenti_titolo) > 0:
                         st.caption(
                             "Il titolo ha movimenti registrati: "
@@ -1429,7 +2129,9 @@ with tab3:
                         modifica_isin,
                         modifica_nome,
                         modifica_valuta,
-                        modifica_percentuale
+                        modifica_percentuale,
+                        modifica_tassazione,
+                        modifica_ticker
                     )
 
                     if successo:
@@ -1594,6 +2296,26 @@ with tab4:
                      "del valore nominale (es. 98,50)."
             )
 
+            nuova_tassazione_input = st.number_input(
+                "Tassazione %",
+                min_value=0.0,
+                max_value=100.0,
+                step=0.5,
+                format="%.2f",
+                value=TASSAZIONE_DEFAULT,
+                key="nuovo_titolo_tassazione",
+                help="Aliquota su capital gain e cedole/dividendi "
+                     "(es. 26 ordinaria, 12,5 titoli di Stato)."
+            )
+
+            nuovo_ticker_input = st.text_input(
+                "Ticker (facoltativo)",
+                placeholder="Es. ENI.MI",
+                key="nuovo_titolo_ticker",
+                help="Simbolo Yahoo Finance per il prezzo online, es. ENI.MI. "
+                     "Se vuoto viene cercato dall'ISIN."
+            )
+
         submit_nuovo_titolo = st.form_submit_button(
             "💾 Registra Titolo",
             type="primary"
@@ -1605,7 +2327,9 @@ with tab4:
             nuovo_isin_input,
             nuovo_nome_input,
             nuova_valuta_input,
-            nuovo_percentuale_input
+            nuovo_percentuale_input,
+            nuova_tassazione_input,
+            nuovo_ticker_input
         )
 
         if successo:
