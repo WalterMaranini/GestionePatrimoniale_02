@@ -1,9 +1,10 @@
 import streamlit as st
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 import pandas as pd
 import re
+import calendar
 
 DB_NAME = "portafoglio.db"
 
@@ -21,6 +22,15 @@ TIPI_PREZZO = {
 # Aliquota sui redditi di capitale e sui capital gain: 26% ordinaria,
 # 12,5% per titoli di Stato italiani ed emittenti "white list".
 TASSAZIONE_DEFAULT = 26.0
+
+# Frequenza di pagamento delle cedole (numero di cedole all'anno)
+FREQUENZE_CEDOLA = {
+    None: "—",
+    1: "Annuale",
+    2: "Semestrale",
+    4: "Trimestrale",
+    12: "Mensile"
+}
 
 COLONNE_TX = (
     "isin",
@@ -69,7 +79,19 @@ COLONNE_TITOLI = {
         "Tassazione %",
         format="%.2f %%"
     ),
-    "ticker": st.column_config.TextColumn("Ticker")
+    "ticker": st.column_config.TextColumn("Ticker"),
+    "data_scadenza": st.column_config.DateColumn(
+        "Scadenza",
+        format="DD/MM/YYYY"
+    ),
+    "cedola_pct": st.column_config.NumberColumn(
+        "Cedola annua %",
+        format="%.3f %%"
+    ),
+    "frequenza_cedola": st.column_config.SelectboxColumn(
+        "Frequenza",
+        options=[k for k in FREQUENZE_CEDOLA if k]
+    )
 }
 
 
@@ -103,7 +125,10 @@ def inizializza_db():
                 valuta TEXT NOT NULL,
                 prezzo_percentuale INTEGER NOT NULL DEFAULT 0,
                 tassazione_pct REAL NOT NULL DEFAULT {TASSAZIONE_DEFAULT},
-                ticker TEXT
+                ticker TEXT,
+                data_scadenza TEXT,
+                cedola_pct REAL,
+                frequenza_cedola INTEGER
             )
         """.format(TASSAZIONE_DEFAULT=TASSAZIONE_DEFAULT))
 
@@ -117,7 +142,10 @@ def inizializza_db():
         colonne_aggiunte = {
             "prezzo_percentuale": "INTEGER NOT NULL DEFAULT 0",
             "tassazione_pct": f"REAL NOT NULL DEFAULT {TASSAZIONE_DEFAULT}",
-            "ticker": "TEXT"
+            "ticker": "TEXT",
+            "data_scadenza": "TEXT",
+            "cedola_pct": "REAL",
+            "frequenza_cedola": "INTEGER"
         }
 
         for colonna, definizione in colonne_aggiunte.items():
@@ -295,7 +323,8 @@ def ottieni_titoli():
         df = pd.read_sql_query(
             """
             SELECT isin, nome_asset, valuta, prezzo_percentuale,
-                   tassazione_pct, ticker
+                   tassazione_pct, ticker, data_scadenza, cedola_pct,
+                   frequenza_cedola
             FROM titoli
             ORDER BY nome_asset ASC
             """,
@@ -304,6 +333,22 @@ def ottieni_titoli():
 
     df["prezzo_percentuale"] = df["prezzo_percentuale"].astype(bool)
     df["ticker"] = df["ticker"].fillna("")
+
+    # Date come datetime.date e valori mancanti come None,
+    # così i widget dei form li ricevono direttamente.
+    df["data_scadenza"] = [
+        datetime.strptime(d, "%Y-%m-%d").date() if d else None
+        for d in df["data_scadenza"]
+    ]
+    df["cedola_pct"] = df["cedola_pct"].astype(object).where(
+        df["cedola_pct"].notna(), None
+    )
+    # dtype object: con valori mancanti pandas userebbe float/NaN
+    df["frequenza_cedola"] = pd.Series(
+        [int(f) if pd.notna(f) else None for f in df["frequenza_cedola"]],
+        index=df.index,
+        dtype=object
+    )
     return df
 
 
@@ -468,13 +513,31 @@ def normalizza_ticker(ticker):
     return (ticker or "").strip().upper() or None
 
 
+def errore_dati_obbligazione(cedola_pct, frequenza_cedola):
+    """Messaggio di errore sui dati della cedola, None se validi."""
+    if cedola_pct is not None and not 0 <= float(cedola_pct) <= 100:
+        return "La cedola annua deve essere compresa tra 0 e 100%."
+
+    if frequenza_cedola not in FREQUENZE_CEDOLA:
+        return "Frequenza della cedola non valida."
+
+    return None
+
+
+def data_iso(data):
+    return data.isoformat() if data else None
+
+
 def inserisci_titolo(
     isin,
     nome_asset,
     valuta,
     prezzo_percentuale,
     tassazione_pct,
-    ticker=""
+    ticker="",
+    data_scadenza=None,
+    cedola_pct=None,
+    frequenza_cedola=None
 ):
 
     isin = isin.strip().upper()
@@ -493,6 +556,11 @@ def inserisci_titolo(
     if not tassazione_valida(tassazione_pct):
         return False, "La tassazione deve essere compresa tra 0 e 100%."
 
+    errore = errore_dati_obbligazione(cedola_pct, frequenza_cedola)
+
+    if errore:
+        return False, errore
+
     try:
         with get_connection() as conn:
             conn.execute(
@@ -503,9 +571,12 @@ def inserisci_titolo(
                     valuta,
                     prezzo_percentuale,
                     tassazione_pct,
-                    ticker
+                    ticker,
+                    data_scadenza,
+                    cedola_pct,
+                    frequenza_cedola
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     isin,
@@ -513,7 +584,10 @@ def inserisci_titolo(
                     valuta,
                     int(prezzo_percentuale),
                     float(tassazione_pct),
-                    normalizza_ticker(ticker)
+                    normalizza_ticker(ticker),
+                    data_iso(data_scadenza),
+                    cedola_pct,
+                    frequenza_cedola
                 )
             )
 
@@ -580,7 +654,10 @@ def aggiorna_titolo(
     valuta,
     prezzo_percentuale,
     tassazione_pct,
-    ticker=""
+    ticker="",
+    data_scadenza=None,
+    cedola_pct=None,
+    frequenza_cedola=None
 ):
     """
     Modifica un titolo esistente. Se cambia il tipo di quotazione,
@@ -600,6 +677,11 @@ def aggiorna_titolo(
 
     if not tassazione_valida(tassazione_pct):
         return False, "La tassazione deve essere compresa tra 0 e 100%."
+
+    errore = errore_dati_obbligazione(cedola_pct, frequenza_cedola)
+
+    if errore:
+        return False, errore
 
     try:
         with get_connection() as conn:
@@ -622,7 +704,8 @@ def aggiorna_titolo(
                 UPDATE titoli
                 SET isin = ?, nome_asset = ?, valuta = ?,
                     prezzo_percentuale = ?, tassazione_pct = ?,
-                    ticker = ?
+                    ticker = ?, data_scadenza = ?, cedola_pct = ?,
+                    frequenza_cedola = ?
                 WHERE isin = ?
                 """,
                 (
@@ -632,6 +715,9 @@ def aggiorna_titolo(
                     int(prezzo_percentuale),
                     float(tassazione_pct),
                     normalizza_ticker(ticker),
+                    data_iso(data_scadenza),
+                    cedola_pct,
+                    frequenza_cedola,
                     isin_originale
                 )
             )
@@ -1006,6 +1092,10 @@ def analizza_titolo(
             (data, segno * m.totale_valore_eur - imposta)
         )
 
+    # Flussi effettivi, prima dell'eventuale valutazione a oggi
+    flussi_lordi_storici = list(flussi_lordi)
+    flussi_netti_storici = list(flussi_netti)
+
     aperta = quantita > 1e-9
     valutata = True
     valore_attuale = 0.0
@@ -1058,6 +1148,8 @@ def analizza_titolo(
         "imposte_cg": imposte_cg if valutata else None,
         "flussi_lordi": flussi_lordi,
         "flussi_netti": flussi_netti,
+        "flussi_lordi_storici": flussi_lordi_storici,
+        "flussi_netti_storici": flussi_netti_storici,
         "avvisi": avvisi
     }
 
@@ -1086,6 +1178,150 @@ def analizza_titolo(
                 else None
             )
         })
+
+    return risultato
+
+
+# ------------------------------------------------------------
+# OBBLIGAZIONI: RENDIMENTO A SCADENZA
+# ------------------------------------------------------------
+
+def aggiungi_mesi(data, mesi):
+    """Sposta una data di n mesi (anche negativi), limitando il giorno."""
+    anno, mese = divmod(data.month - 1 + mesi, 12)
+    anno += data.year
+    mese += 1
+    giorno = min(data.day, calendar.monthrange(anno, mese)[1])
+    return date(anno, mese, giorno)
+
+
+def calendario_cedole(scadenza, frequenza, oggi):
+    """
+    Date delle cedole future (dopo oggi, fino alla scadenza inclusa)
+    e data dell'ultima cedola già staccata, ricostruite a ritroso
+    dalla scadenza.
+    """
+    passo = 12 // frequenza
+    future = []
+    n = 0
+    data_cedola = scadenza
+
+    while data_cedola > oggi:
+        future.append(data_cedola)
+        n += 1
+        data_cedola = aggiungi_mesi(scadenza, -passo * n)
+
+    return sorted(future), data_cedola
+
+
+def analizza_obbligazione(
+    titolo,
+    analisi,
+    prezzo_attuale=None,
+    cambio_attuale=None,
+    oggi=None
+):
+    """
+    Rendimento a scadenza di un'obbligazione. Restituisce None se in
+    anagrafica mancano scadenza o cedola.
+
+    - YTM di mercato (in valuta, per 100 di nominale): tasso che
+      eguaglia prezzo attuale + rateo ai flussi futuri (cedole e
+      rimborso a 100). Richiede il prezzo attuale.
+    - Rendimento a scadenza dell'investimento (in EUR): XIRR dei
+      flussi già avvenuti più cedole future e rimborso della
+      quantità in portafoglio, convertiti al cambio attuale
+      (ipotesi: cambio invariato fino a scadenza).
+
+    Al netto: cedole tassate all'aliquota del titolo e imposta sulla
+    plusvalenza al rimborso (stima, senza compensazioni).
+    """
+    oggi = oggi or date.today()
+    scadenza = titolo["data_scadenza"]
+    cedola_pct = titolo["cedola_pct"]
+    frequenza = titolo["frequenza_cedola"]
+
+    if (
+        not titolo["prezzo_percentuale"]
+        or scadenza is None
+        or cedola_pct is None
+        or (cedola_pct > 0 and not frequenza)
+    ):
+        return None
+
+    aliquota = float(titolo["tassazione_pct"]) / 100
+
+    risultato = {
+        "scadenza": scadenza,
+        "anni_residui": max((scadenza - oggi).days, 0) / 365.0,
+        "scaduta": scadenza <= oggi
+    }
+
+    if risultato["scaduta"]:
+        return risultato
+
+    if cedola_pct > 0:
+        date_cedole, ultima_cedola = calendario_cedole(scadenza, frequenza, oggi)
+        cedola_periodo = cedola_pct / frequenza
+        rateo = cedola_periodo * (
+            (oggi - ultima_cedola).days
+            / (date_cedole[0] - ultima_cedola).days
+        )
+    else:
+        date_cedole, cedola_periodo, rateo = [], 0.0, 0.0
+
+    risultato["rateo"] = rateo
+
+    # 1) YTM di mercato, per 100 di nominale
+    if prezzo_attuale:
+
+        def flussi_mercato(imposta):
+            # Chi compra paga il rateo al venditore, che ne sostiene
+            # le imposte: sulla prima cedola il compratore è tassato
+            # solo sulla parte maturata dopo l'acquisto.
+            cedole = [
+                (
+                    d,
+                    cedola_periodo
+                    - imposta * (cedola_periodo - (rateo if i == 0 else 0))
+                )
+                for i, d in enumerate(date_cedole)
+            ]
+            return (
+                [(oggi, -(prezzo_attuale + rateo))]
+                + cedole
+                + [(scadenza, 100 - imposta * max(100 - prezzo_attuale, 0))]
+            )
+
+        risultato["ytm_lordo"] = xirr(flussi_mercato(0.0))
+        risultato["ytm_netto"] = xirr(flussi_mercato(aliquota))
+
+    # 2) Rendimento a scadenza dell'investimento, in EUR
+    if analisi["aperta"] and cambio_attuale:
+
+        nominale = analisi["quantita_aperta"]
+        cedola_eur = cedola_periodo * nominale / 100 / cambio_attuale
+        rimborso_eur = nominale / cambio_attuale
+        imposta_rimborso = (
+            max(rimborso_eur - analisi["carico_residuo"], 0) * aliquota
+        )
+
+        futuri_lordi = (
+            [(d, cedola_eur) for d in date_cedole]
+            + [(scadenza, rimborso_eur)]
+        )
+        futuri_netti = (
+            [(d, cedola_eur * (1 - aliquota)) for d in date_cedole]
+            + [(scadenza, rimborso_eur - imposta_rimborso)]
+        )
+
+        flussi_netti = analisi["flussi_netti_storici"] + futuri_netti
+
+        risultato["rend_scadenza_lordo"] = xirr(
+            analisi["flussi_lordi_storici"] + futuri_lordi
+        )
+        risultato["rend_scadenza_netto"] = xirr(flussi_netti)
+        risultato["guadagno_netto_scadenza"] = sum(v for _, v in flussi_netti)
 
     return risultato
 
@@ -1138,37 +1374,103 @@ def quotazione_online(ticker):
 
 
 def cambio_online(valuta):
-    """Unità di valuta per 1 EUR, la stessa convenzione dei movimenti."""
+    """
+    Cambio attuale in unità di valuta per 1 EUR (la stessa
+    convenzione dei movimenti) e data della rilevazione.
+    """
     if valuta == "EUR":
-        return 1.0
+        return 1.0, None
 
     quotazione = quotazione_online(f"EUR{valuta}=X")
-    return quotazione["prezzo"] if quotazione else None
+
+    if quotazione is None:
+        return None, None
+
+    return quotazione["prezzo"], quotazione["data"]
 
 
 def valutazione_online(titolo):
     """
-    Prezzo e cambio attuali di un titolo da Yahoo Finance, con
-    l'indicazione della fonte da mostrare all'utente.
+    Prezzo e cambio attuali di un titolo da Yahoo Finance, con le
+    date di rilevazione e l'indicazione della fonte del prezzo.
     """
     ticker = titolo["ticker"] or ticker_da_isin(titolo["isin"])
-    cambio = cambio_online(titolo["valuta"])
+    cambio, data_cambio = cambio_online(titolo["valuta"])
+
+    risultato = {
+        "ticker": ticker or "",
+        "prezzo": None,
+        "data_prezzo": None,
+        "cambio": cambio,
+        "data_cambio": data_cambio
+    }
 
     if not ticker:
-        return None, cambio, "", None, "Non trovato online"
+        return {**risultato, "fonte": "Non trovato online"}
 
     quotazione = quotazione_online(ticker)
 
     if quotazione is None:
-        return None, cambio, ticker, None, "Prezzo non disponibile"
+        return {**risultato, "fonte": "Prezzo non disponibile"}
 
     if quotazione["valuta"] and quotazione["valuta"] != titolo["valuta"]:
-        return (
-            None, cambio, ticker, None,
-            f"Quotato in {quotazione['valuta']}, non {titolo['valuta']}"
-        )
+        return {
+            **risultato,
+            "fonte": f"Quotato in {quotazione['valuta']}, non {titolo['valuta']}"
+        }
 
-    return quotazione["prezzo"], cambio, ticker, quotazione["data"], "Online"
+    return {
+        **risultato,
+        "prezzo": quotazione["prezzo"],
+        "data_prezzo": quotazione["data"],
+        "fonte": "Online"
+    }
+
+
+# ============================================================
+# CAMPI OBBLIGAZIONE (anagrafica)
+# ============================================================
+
+def campi_obbligazione(prefisso_key, titolo=None):
+    """
+    Campi facoltativi per le obbligazioni (scadenza, cedola annua,
+    frequenza), usati per il rendimento a scadenza. Restituisce
+    (data_scadenza, cedola_pct, frequenza_cedola).
+    """
+    st.caption("Solo obbligazioni (per il rendimento a scadenza):")
+
+    data_scadenza = st.date_input(
+        "Data scadenza",
+        value=titolo["data_scadenza"] if titolo is not None else None,
+        min_value=date(1990, 1, 1),
+        max_value=date(2100, 12, 31),
+        format="DD/MM/YYYY",
+        key=f"{prefisso_key}_scadenza"
+    )
+
+    cedola_pct = st.number_input(
+        "Cedola annua %",
+        min_value=0.0,
+        max_value=100.0,
+        step=0.125,
+        format="%.3f",
+        value=titolo["cedola_pct"] if titolo is not None else None,
+        key=f"{prefisso_key}_cedola_pct",
+        help="Tasso cedolare annuo lordo sul nominale (0 per zero coupon)."
+    )
+
+    frequenze = list(FREQUENZE_CEDOLA)
+    frequenza_cedola = st.selectbox(
+        "Frequenza cedola",
+        frequenze,
+        index=frequenze.index(
+            titolo["frequenza_cedola"] if titolo is not None else None
+        ),
+        format_func=FREQUENZE_CEDOLA.get,
+        key=f"{prefisso_key}_frequenza"
+    )
+
+    return data_scadenza, cedola_pct, frequenza_cedola
 
 
 # ============================================================
@@ -1686,19 +1988,18 @@ with tab_rend:
 
             with st.spinner("Recupero prezzi da Yahoo Finance..."):
                 for _, titolo in titoli_aperti.iterrows():
-                    prezzo, cambio, ticker, data_prezzo, fonte = (
-                        valutazione_online(titolo)
-                    )
+                    online = valutazione_online(titolo)
                     righe_valutazione.append({
                         "ISIN": titolo["isin"],
                         "Strumento": titolo["nome_asset"],
-                        "Ticker": ticker,
+                        "Ticker": online["ticker"],
                         "Quantità": analisi_base[titolo["isin"]]["quantita_aperta"],
                         "Valuta": titolo["valuta"],
-                        "Prezzo attuale": prezzo,
-                        "Cambio": cambio,
-                        "Data prezzo": data_prezzo,
-                        "Fonte": fonte
+                        "Prezzo attuale": online["prezzo"],
+                        "Data prezzo": online["data_prezzo"],
+                        "Cambio": online["cambio"],
+                        "Data cambio": online["data_cambio"],
+                        "Fonte prezzo": online["fonte"]
                     })
 
             st.caption(
@@ -1706,7 +2007,8 @@ with tab_rend:
                 "direttamente in tabella (restano validi fino alla "
                 "chiusura della pagina). Per le obbligazioni il prezzo "
                 "è in % del nominale; il cambio è in unità di valuta "
-                "per 1 EUR."
+                "per 1 EUR. Le date indicano l'ultima rilevazione "
+                "disponibile su Yahoo Finance."
             )
 
             df_valutazione = st.data_editor(
@@ -1716,7 +2018,7 @@ with tab_rend:
                 width="stretch",
                 disabled=[
                     "ISIN", "Strumento", "Ticker", "Quantità",
-                    "Valuta", "Data prezzo", "Fonte"
+                    "Valuta", "Data prezzo", "Data cambio", "Fonte prezzo"
                 ],
                 column_config={
                     "Quantità": st.column_config.NumberColumn(format="%.2f"),
@@ -1727,6 +2029,9 @@ with tab_rend:
                         min_value=0.0001, format="%.4f"
                     ),
                     "Data prezzo": st.column_config.DateColumn(
+                        format="DD/MM/YYYY"
+                    ),
+                    "Data cambio": st.column_config.DateColumn(
                         format="DD/MM/YYYY"
                     )
                 }
@@ -1866,6 +2171,84 @@ with tab_rend:
                 }
             }
         )
+
+        # ----------------------------------------------------
+        # OBBLIGAZIONI: RENDIMENTO A SCADENZA
+        # ----------------------------------------------------
+
+        righe_obbligazioni = []
+        dati_mancanti = []
+
+        for _, titolo in df_titoli_rend.iterrows():
+
+            if not titolo["prezzo_percentuale"]:
+                continue
+
+            prezzo, cambio = valutazioni.get(titolo["isin"], (None, None))
+            o = analizza_obbligazione(
+                titolo, analisi[titolo["isin"]], prezzo, cambio
+            )
+
+            if o is None:
+                dati_mancanti.append(titolo["nome_asset"])
+                continue
+
+            righe_obbligazioni.append({
+                "Strumento": titolo["nome_asset"],
+                "Scadenza": o["scadenza"],
+                "Vita residua (anni)": o["anni_residui"],
+                "Cedola annua %": titolo["cedola_pct"],
+                "Prezzo attuale": prezzo,
+                "Rateo maturato": o.get("rateo"),
+                "YTM lordo %": percentuale(o.get("ytm_lordo")),
+                "YTM netto %": percentuale(o.get("ytm_netto")),
+                "Rend. a scadenza lordo %": percentuale(o.get("rend_scadenza_lordo")),
+                "Rend. a scadenza netto %": percentuale(o.get("rend_scadenza_netto")),
+                "Guadagno netto a scadenza": o.get("guadagno_netto_scadenza")
+            })
+
+        if righe_obbligazioni or dati_mancanti:
+
+            st.markdown("#### Obbligazioni: rendimento a scadenza")
+
+        if righe_obbligazioni:
+
+            st.dataframe(
+                pd.DataFrame(righe_obbligazioni),
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Scadenza": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                    "Vita residua (anni)": st.column_config.NumberColumn(format="%.2f"),
+                    "Cedola annua %": st.column_config.NumberColumn(format="%.3f %%"),
+                    "Prezzo attuale": st.column_config.NumberColumn(format="%.4f"),
+                    "Rateo maturato": st.column_config.NumberColumn(format="%.4f"),
+                    "YTM lordo %": COLONNA_PCT,
+                    "YTM netto %": COLONNA_PCT,
+                    "Rend. a scadenza lordo %": COLONNA_PCT,
+                    "Rend. a scadenza netto %": COLONNA_PCT,
+                    "Guadagno netto a scadenza": COLONNA_EURO
+                }
+            )
+
+            st.caption(
+                "**YTM**: rendimento annuo nella valuta del titolo per chi "
+                "compra oggi al prezzo attuale (+ rateo, per 100 di "
+                "nominale) e tiene fino a scadenza. **Rend. a scadenza**: "
+                "rendimento annuo in EUR del tuo investimento, con i "
+                "flussi già avvenuti più cedole future e rimborso a 100, "
+                "convertiti al cambio attuale (ipotesi: cambio invariato "
+                "fino a scadenza). Netto: cedole all'aliquota del titolo "
+                "e imposta stimata sulla plusvalenza al rimborso."
+            )
+
+        if dati_mancanti:
+
+            st.info(
+                "Per il rendimento a scadenza completa data di "
+                "scadenza, cedola annua e frequenza in anagrafica: "
+                + ", ".join(dati_mancanti)
+            )
 
         with st.expander("ℹ️ Come leggere gli indici"):
             st.markdown(
@@ -2075,6 +2458,15 @@ with tab3:
                 st.write(f"**Tassazione:** {titolo['tassazione_pct']:.2f} %")
                 st.write(f"**Ticker:** {titolo['ticker'] or '— (ricerca da ISIN)'}")
 
+                if titolo["data_scadenza"]:
+                    st.write(f"**Scadenza:** {titolo['data_scadenza']:%d/%m/%Y}")
+
+                if titolo["cedola_pct"] is not None:
+                    st.write(
+                        f"**Cedola:** {titolo['cedola_pct']:.3f} % "
+                        f"{FREQUENZE_CEDOLA[titolo['frequenza_cedola']].lower()}"
+                    )
+
                 if not valida_isin(titolo["isin"]):
                     st.warning(
                         "L'ISIN di questo titolo non è nel formato "
@@ -2146,6 +2538,12 @@ with tab3:
                              "Se vuoto viene cercato dall'ISIN."
                     )
 
+                    (
+                        modifica_scadenza,
+                        modifica_cedola_pct,
+                        modifica_frequenza
+                    ) = campi_obbligazione(f"modifica{suf_titolo}", titolo)
+
                     if len(df_movimenti_titolo) > 0:
                         st.caption(
                             "Il titolo ha movimenti registrati: "
@@ -2168,7 +2566,10 @@ with tab3:
                         modifica_valuta,
                         modifica_percentuale,
                         modifica_tassazione,
-                        modifica_ticker
+                        modifica_ticker,
+                        modifica_scadenza,
+                        modifica_cedola_pct,
+                        modifica_frequenza
                     )
 
                     if successo:
@@ -2353,6 +2754,13 @@ with tab4:
                      "Se vuoto viene cercato dall'ISIN."
             )
 
+        with col1:
+            (
+                nuova_scadenza_input,
+                nuova_cedola_pct_input,
+                nuova_frequenza_input
+            ) = campi_obbligazione("nuovo_titolo")
+
         submit_nuovo_titolo = st.form_submit_button(
             "💾 Registra Titolo",
             type="primary"
@@ -2366,7 +2774,10 @@ with tab4:
             nuova_valuta_input,
             nuovo_percentuale_input,
             nuova_tassazione_input,
-            nuovo_ticker_input
+            nuovo_ticker_input,
+            nuova_scadenza_input,
+            nuova_cedola_pct_input,
+            nuova_frequenza_input
         )
 
         if successo:
